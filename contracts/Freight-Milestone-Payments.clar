@@ -8,6 +8,11 @@
 (define-constant ERR_SHIPMENT_NOT_ACTIVE (err u105))
 (define-constant ERR_INVALID_PARTICIPANT (err u106))
 (define-constant ERR_MILESTONE_NOT_COMPLETED (err u107))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u108))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u109))
+(define-constant ERR_DISPUTE_RESOLVED (err u110))
+(define-constant ERR_NOT_ARBITRATOR (err u111))
+(define-constant ERR_INVALID_DISPUTE_TYPE (err u112))
 
 (define-constant MILESTONE_PICKUP u1)
 (define-constant MILESTONE_HALFWAY u2)
@@ -18,7 +23,17 @@
 (define-constant STATUS_COMPLETED u2)
 (define-constant STATUS_CANCELLED u3)
 
+(define-constant DISPUTE_MILESTONE u1)
+(define-constant DISPUTE_PAYMENT u2)
+(define-constant DISPUTE_CANCELLATION u3)
+
+(define-constant DISPUTE_STATUS_OPEN u1)
+(define-constant DISPUTE_STATUS_UNDER_REVIEW u2)
+(define-constant DISPUTE_STATUS_RESOLVED u3)
+
 (define-data-var next-shipment-id uint u1)
+(define-data-var next-dispute-id uint u1)
+(define-data-var contract-arbitrator principal tx-sender)
 
 (define-map shipments uint {
     shipper: principal,
@@ -38,6 +53,27 @@
 })
 
 (define-map shipment-funds uint uint)
+
+(define-map disputes uint {
+    shipment-id: uint,
+    dispute-type: uint,
+    initiator: principal,
+    respondent: principal,
+    description: (string-ascii 500),
+    milestone: (optional uint),
+    status: uint,
+    created-block: uint,
+    resolved-block: (optional uint),
+    resolution: (optional (string-ascii 500)),
+    winner: (optional principal)
+})
+
+(define-map dispute-evidence uint {
+    dispute-id: uint,
+    submitter: principal,
+    evidence: (string-ascii 1000),
+    submitted-block: uint
+})
 
 (define-private (is-valid-milestone (milestone uint))
     (or 
@@ -166,6 +202,93 @@
                 true))
         (ok true)))
 
+(define-public (create-dispute 
+    (shipment-id uint)
+    (dispute-type uint)
+    (description (string-ascii 500))
+    (milestone (optional uint)))
+    (let ((shipment (unwrap! (map-get? shipments shipment-id) ERR_SHIPMENT_NOT_FOUND))
+          (dispute-id (var-get next-dispute-id))
+          (respondent (if (is-eq tx-sender (get shipper shipment)) 
+                         (get trucker shipment) 
+                         (get shipper shipment))))
+        (asserts! (or (is-eq dispute-type DISPUTE_MILESTONE) 
+                     (or (is-eq dispute-type DISPUTE_PAYMENT) 
+                         (is-eq dispute-type DISPUTE_CANCELLATION))) ERR_INVALID_DISPUTE_TYPE)
+        (asserts! (or (is-eq tx-sender (get shipper shipment)) 
+                     (is-eq tx-sender (get trucker shipment))) ERR_NOT_AUTHORIZED)
+        (asserts! (> (len description) u0) ERR_INVALID_DISPUTE_TYPE)
+        
+        (map-set disputes dispute-id {
+            shipment-id: shipment-id,
+            dispute-type: dispute-type,
+            initiator: tx-sender,
+            respondent: respondent,
+            description: description,
+            milestone: milestone,
+            status: DISPUTE_STATUS_OPEN,
+            created-block: stacks-block-height,
+            resolved-block: none,
+            resolution: none,
+            winner: none
+        })
+        
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)))
+
+(define-public (submit-evidence (dispute-id uint) (evidence (string-ascii 1000)))
+    (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND)))
+        (asserts! (or (is-eq tx-sender (get initiator dispute)) 
+                     (is-eq tx-sender (get respondent dispute))) ERR_NOT_AUTHORIZED)
+        (asserts! (not (is-eq (get status dispute) DISPUTE_STATUS_RESOLVED)) ERR_DISPUTE_RESOLVED)
+        (asserts! (> (len evidence) u0) ERR_INVALID_DISPUTE_TYPE)
+        
+        (map-set dispute-evidence dispute-id {
+            dispute-id: dispute-id,
+            submitter: tx-sender,
+            evidence: evidence,
+            submitted-block: stacks-block-height
+        })
+        
+        (ok true)))
+
+(define-public (arbitrate-dispute 
+    (dispute-id uint)
+    (winner principal)
+    (resolution (string-ascii 500)))
+    (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (var-get contract-arbitrator)) ERR_NOT_ARBITRATOR)
+        (asserts! (not (is-eq (get status dispute) DISPUTE_STATUS_RESOLVED)) ERR_DISPUTE_RESOLVED)
+        (asserts! (or (is-eq winner (get initiator dispute)) 
+                     (is-eq winner (get respondent dispute))) ERR_INVALID_PARTICIPANT)
+        
+        (map-set disputes dispute-id (merge dispute {
+            status: DISPUTE_STATUS_RESOLVED,
+            resolved-block: (some stacks-block-height),
+            resolution: (some resolution),
+            winner: (some winner)
+        }))
+        
+        (ok true)))
+
+(define-public (escalate-dispute (dispute-id uint))
+    (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND)))
+        (asserts! (or (is-eq tx-sender (get initiator dispute)) 
+                     (is-eq tx-sender (get respondent dispute))) ERR_NOT_AUTHORIZED)
+        (asserts! (is-eq (get status dispute) DISPUTE_STATUS_OPEN) ERR_DISPUTE_RESOLVED)
+        
+        (map-set disputes dispute-id (merge dispute {
+            status: DISPUTE_STATUS_UNDER_REVIEW
+        }))
+        
+        (ok true)))
+
+(define-public (set-arbitrator (new-arbitrator principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-arbitrator)) ERR_NOT_ARBITRATOR)
+        (var-set contract-arbitrator new-arbitrator)
+        (ok true)))
+
 (define-read-only (get-shipment (shipment-id uint))
     (map-get? shipments shipment-id))
 
@@ -221,3 +344,12 @@
 
 (define-read-only (get-next-shipment-id)
     (var-get next-shipment-id))
+
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? disputes dispute-id))
+
+(define-read-only (get-dispute-evidence (evidence-id uint))
+    (map-get? dispute-evidence evidence-id))
+
+(define-read-only (get-contract-arbitrator)
+    (var-get contract-arbitrator))
